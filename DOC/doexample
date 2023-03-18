@@ -1,0 +1,51 @@
+# usqdark dark2_*k.fits:k dark2k.fits log=sep27log
+# usqdark dark2_*k.fits:h dark2h.fits log=sep27log
+# usqdark dark2_*k.fits:j dark2j.fits log=sep27log
+# usqdark dark2_*k.fits:l dark2l.fits log=sep27log
+# usqdark dark5_*k.fits:k dark5k.fits log=sep27log
+# usqdark dark5_*k.fits:h dark5h.fits log=sep27log
+# usqdark dark5_*k.fits:j dark5j.fits log=sep27log
+# usqdark dark5_*k.fits:l dark5l.fits log=sep27log
+# usqflat @skyk.lis:k sep27flatk.fits dark5k.fits log=sep27log
+# usqflat @skyk.lis:h sep27flath.fits dark5h.fits log=sep27log
+# usqflat @skyk.lis:j sep27flatj.fits dark5j.fits log=sep27log
+# usqflat @skyk.lis:l sep27flatl.fits dark5l.fits log=sep27log
+# usqsky  @skyk.lis:k sep27skyk.fits log=sep27log
+# usqsky  @skyk.lis:h sep27skyh.fits log=sep27log
+# usqsky  @skyk.lis:j sep27skyj.fits log=sep27log
+# usqsky  @skyk.lis:l sep27skyl.fits log=sep27log
+# usqproc @n7538k.lis:k %n%pn% sep27flatk sep27skyk log=sep27log
+# usqproc @n7538k.lis:h %n%pn% sep27flath sep27skyh log=sep27log
+# usqproc @n7538k.lis:j %n%pn% sep27flatj sep27skyj log=sep27log
+# usqproc @n7538k.lis:l %n%pn% sep27flatl sep27skyl log=sep27log
+# xyget @pn7538k.lis "1-10|1"
+# nircombine n7538k.fits pn7538k.lis.xycom frame="1-10" setpix+ mask=maskok_k
+## use geo files from sep00
+# xyadopt @pn7538k.lis:h "1-10|1" pn7538k.lis.xycom tran+ db_tran=htokall6sort.geodb geom_tran=general
+# xyadoptpl@pn7538k.lis:j "1-10|1" pn7538k.lis.xycom tran+ db_tran=jtokall6sort.geodb geom_tran=general
+# nircombine n7538h.fits pn7538h.lis.xycom frame="1-10" setpix+ mask=/pixels3/sqiid/sep00/maskok_h.fits common=median lthresh=-600
+# nircombine n7538j.fits pn7538j.lis.xycom frame="1-10" setpix+ mask=/pixels3/sqiid/sep00/maskok_j.fits common=median lthresh=-600
+# usqsky  @n7129skyk.lis:k n7129skyk.fits log=sep27log
+# usqsky  @n7129skyk.lis:h n7129skyh.fits log=sep27log
+# usqsky  @n7129skyk.lis:j n7129skyj.fits log=sep27log
+# usqproc @n7129skyk.lis:k %n%pn% sep27flatk n7129skyk log=sep27log
+# usqproc @n7129skyk.lis:h %n%pn% sep27flath n7129skyh log=sep27log
+# usqproc @n7129skyk.lis:j %n%pn% sep27flatj n7129skyj log=sep27log
+# xyget @pn7129k.lis "1-15|1"
+# nircombine n7129k.fits pn7129k.lis.xycom frame="1-15" setpix+ mask=maskok_k
+# xyadopt @pn7129k.lis:h "1-15|1" pn7129k.lis.xycom tran+ db_tran=htokall6sort.geodb geom_tran=general
+# xyadopt @pn7129k.lis:j "1-15|1" pn7129k.lis.xycom tran+ db_tran=jtokall6sort.geodb geom_tran=general
+# nircombine n7129h.fits pn7129h.lis.xycom frame="1-15" setpix+ mask=/pixels3/sqiid/sep00/maskok_h.fits common=median lthresh=-600
+# nircombine n7129j.fits pn7129j.lis.xycom frame="1-15" setpix+ mask=/pixels3/sqiid/sep00/maskok_j.fits common=median lthresh=-600
+#### combine sep00 and sep01 data
+# xyget @sep00to01n7129redk.lis "1-2|1"
+# mergecom @n7129k.xyget combn7129k.xycom renumber+
+# nircombine combn7129k.fits combn7129k.xycom frame="3-32" setpix+ mask=maskok_k common="median" stat_sec="overlap" to_scale=1.000 to_name="INT_SK"
+# xyadopt @combn7129redk.lis:h "1-32|1" combn7129k.xycom tran+ db_tran=htokall6sort.geodb geom_tran=general
+# xyadopt @combn7129redk.lis:j "1-32|1" combn7129k.xycom tran+ db_tran=jtokall6sort.geodb geom_tran=general
+# nircombine combn7129h.fits combn7129redh.lis.xycom frame="3-32" setpix+ mask=maskok_h common="median" stat_sec="overlap" to_scale=1.000 to_name="INT_SK"
+# nircombine combn7129j.fits combn7129redj.lis.xycom frame="3-32" setpix+ mask=maskok_j common="median" stat_sec="overlap" to_scale=1.000 to_name="INT_SK"
+#            SECTION     NPIX     MEAN   MEDIAN   STDDEV      MIN      MAX
+#K [510:520,276:286]      121   -2.621    -2.65   0.3697   -3.652   -1.793
+#H [510:520,276:286]      121   -2.699   -2.703   0.2651   -3.328   -2.079
+#J [510:520,276:286]      121    -1.06   -1.053   0.1258   -1.574  -0.7507

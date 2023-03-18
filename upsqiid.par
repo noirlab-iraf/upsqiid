@@ -1,0 +1,2 @@
+gim_extn,s,h,"imh",imh|fit|fits|pl|all,,"Global image extension? (imh|fit|fits|pl|all)"
+id_color,s,h,"end",end|none|predot|sequence,,"Type of color indicator? (end|none|predot|seq)"

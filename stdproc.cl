@@ -1,0 +1,527 @@
+# STDPROC: 23MAR02 KMM expects IRAF 2.11Export or later
+# STDPROC: -- process SQIID raw image data for standards using either
+#   1) the moving mean/median from a subset of frames (within selected list
+#      distance of each frame and excluding the given frame) to produce a SKY
+#      frame for a given frame
+#   or
+#   2) performing pairwise subtraction:
+#            5    
+#         2  1  3
+#            4
+#      1-2;2-3;3-2;4-5;5-4
+#   Processes data from list number FIRST_PROC to list number LAST_PROC:
+#   it creates a sky frame from the INCLUDE number of images nearest the
+#   processed frame.  This is equivalent to a running median which excludes
+#   the image being processed.
+# ABUNOTCH: 27JUL98 KMM incorporate imexpr into setpix option
+#                       tailor sqnotch for abu
+# ABUNOTCH: 01AUG98 KMM enable grouped sky processing
+# MOVPROC: 07AUG98 KMM rename as MOVPROC with minor parameter renaming
+# MOVPROC: 16AUG98 KMM modified imexpr to produce explicitly real for setpix
+# MOVPROC: 03MAR99 KMM remove blankimage option; will always compute skyframe
+# STDPROC: 20MAR99 KMM setup processing for standards
+# STDPROC: 17MAY00 KMM modify for SQIID
+# STDPROC: 20FEB01 KMM tweak for SQIID
+#          25MAR02 KMM changes to imcombine parameters for IRAF 2.12
+
+procedure stdproc (input, output, flatimage)
+
+string input      {prompt="Input raw images"}
+string output     {prompt="Output image descriptor: @list||.ext||%in%out%"}
+string flatimage  {prompt="Input flat field image name"}
+#string blankimage {prompt='Input blank field image name: "compute"==compute'}
+
+bool   fixpix     {no,prompt="Run FIXPIX on data?"}
+string badpix     {"badpix", prompt="badpix file in FIXPIX format"}
+bool   setpix     {no,prompt="Run SETPIX on data?"}
+string maskimage  {"badmask", prompt="untransposed bad pixel image mask"}
+real   svalue     {0,  prompt="pixel value for masked pixels (eg -1.0e7)"}
+real   bvalue     {0.0,prompt="Value if there are no pixels"}
+
+bool   orient     {no,prompt="Orient image with N up and E left"}
+bool   verbose    {yes,prompt="Verbose output?"}
+file   logfile    {"STDOUT",prompt="logfile name"}
+
+bool   notch      {no, prompt="Median notch (else pairwise subtract)?"}
+#int    include    {0, prompt="Number of included images in blankimage subset"}
+int    improc     {5, prompt="Number of images to process in group"}
+#int    imskip     {0, prompt="Number of images to skip between process"}
+int    first_proc {1, prompt="List number of first image to be processed"}
+int    last_proc  {1000, prompt="List number of last image to be processed"}
+
+bool   docenter   {no, prompt="Find coordinates of standards?"}
+string findsub    {"[100:400,100:400]", prompt="Section for finding standards"}
+real   fthreshold { 25.,   prompt="Threshold in sigma for feature detection"}
+real   fwhm       { 5.,    prompt="FWHM of the PSF in scale units"}
+real   fsigma     { INDEF, prompt="Standard deviation of background in counts"}
+real   fdatamin   { -25.,  prompt="Minimum good data value"}
+real   fdatamax   { INDEF, prompt="Maximum good data value"}
+
+bool   dophot     {no, prompt="Run QPHOT on standards"}
+real   qcbox      { 5., prompt="Centering box width in pixels"}
+real   qannulus   { 10., prompt="Inner radius of sky annulus in pixels"}
+real   qdannulus  { 3., prompt="Width of the sky annulus in pixels"}
+string qapertures { "5,6,7,8,9,10", prompt="List of photometry apertures"}
+real   qzmag      { 25., prompt="Zero point of magnitude scale"}
+string qexposure  { "INT_SJ", prompt="Exposure time image header keyword"}
+string qairmass   { "AIRMASS", prompt="Airmass image header key word"}
+string qfilter    { "FILTER", prompt="Filter image header keyword"}
+string filter     { "", prompt="Filter name?"}
+string qstarid    { "STAR_ID", prompt="Star ID image header keyword"}
+string starid     { "", prompt="Star ID?"}
+
+string darkimage  {"null",prompt='Input dark_count image ("null"==noaction)'}
+string norm_opt   {"zero", enum="zero|scale|none",
+                       prompt="Type of combine operation: |zero|scale|none|"}
+string norm_stat  {"median",enum="none|mean|median|mode",
+                    prompt="Pre-combine common offset: |none|mean|median|mode|"}
+# imcombine parameters;
+#string comb_opt   {"median", enum="average|median",
+#                       prompt="Type of combine operation: |average|median|"}
+string reject_opt {"none", prompt="Type of pixel rejection operation",
+                    enum="none|minmax|ccdclip|crreject|sigclip|avsigclip|pclip"}
+string statsec    {"[100:400,100:400]",
+                    prompt="Image section for calculating statistics"}
+real   lthreshold {INDEF,prompt="Lower threshold for exclusion in statistics"}
+real   hthreshold {INDEF,prompt="Upper threshold for exclusion in statistics"}
+bool   mclip      {no, prompt="Use median, not mean, in clip algorithms"}
+real   pclip      {-0.5, prompt="pclip: Percentile clipping parameter"}
+string weight     {"none",prompt="Image weights"}
+string expname    {"", prompt="Image header exposure time keyword"}
+int    nlow       {1, prompt="minmax: Number of low pixels to reject"}
+int    nhigh      {1, prompt="minmax: Number of high pixels to reject"}
+int    nkeep      {0, prompt="Min to keep (pos) or max to reject (neg)"}
+real   lsigma     {3., prompt="Lower sigma clipping factor"}
+real   hsigma     {3., prompt="Upper sigma clipping factor"}
+string rdnoise    {"0.", prompt="ccdclip: CCD readout noise (electrons)"}
+string gain       {"1.", prompt="ccdclip: CCD gain (electrons/DN)"}
+string snoise     {"0.", prompt="ccdclip: Sensitivity noise (fraction)"}
+real   sigscale   {0.1,
+                     prompt="Tolerance for sigma clipping scaling correction"}
+int    grow       {0, prompt="Radius (pixels) for 1D neighbor rejection"}
+   
+struct  *inlist,*outlist,*imglist,*l_list
+
+begin
+
+   int    nin, irootlen, orootlen, stat, pos1b, pos1e, pos2b, pos2e,
+          nxlotrim,nxhitrim,nylotrim,nyhitrim, ncols, nrows,
+          img_num, first_in, last_in, ilist, gnum
+   real   rnorm, rmean, rmedian, rmode, fract, rawmedian
+   string in,in1,in2,out,iroot,oroot,uniq,img,sname,sout,sbuff,sjunk,
+          smean, smedian, smode, front, srcsub, 
+          combopt, zeroopt, scaleopt, normstat, reject
+   file   skyimg,  nflat, infile, outfile, im1, im2, im3, tmp1, tmp2, tmp3,
+          tmp4, tmp5, l_log, task
+   bool   found
+   bool   debug=no
+   int    nex
+   string gimextn, imextn, imname, imroot
+   int    include, imskip, sub_num,
+          nxhi, nxlo, nyhi, nylo, nxhisrc, nxlosrc, nyhisrc, nylosrc
+   real   rsdev, rmin, xcen, ycen, rmag
+   string imsky, imobj, imprior, imnext
+   struct line = ""
+
+# Assign positional parameters to local variables
+   in          = input
+   out         = output
+   nflat       = flatimage
+#   skyimg      = blankimage
+   
+# get IRAF global image extension
+   show("imtype") | translit ("",","," ",delete-) | scan (gimextn)
+   nex     = strlen(gimextn)  
+
+   combopt = "median"
+   normstat = norm_stat
+   reject = reject_opt
+   if (norm_opt == "zero") {
+      scaleopt  = "none"
+      zeroopt   = normstat
+   } else if (norm_opt == "scale") {
+      scaleopt  = normstat
+      normstat  = normstat
+      zeroopt   = "none"
+   } else {
+      scaleopt  = "none"
+      zeroopt   = "none"
+      normstat  = "none"
+   }
+   
+   imskip = 0
+   include = improc - 1
+   if (docenter) { # get coordinates of finder box
+      print (findsub) | translit ("", "[:,]", "    ") |
+         scan(nxlo,nxhi,nylo,nyhi)
+      if (nscan() != 4) {
+         nxlosrc = 1
+	 nylosrc = 1
+      }
+   }
+   
+   uniq        = mktemp ("_Tabp")
+   infile      = mktemp ("tmp$abn")
+   outfile     = mktemp ("tmp$abn")
+   tmp1        = mktemp ("tmp$abn")
+   tmp2        = mktemp ("tmp$abn")
+   tmp3        = mktemp ("tmp$abn")
+   tmp4        = mktemp ("tmp$abn")
+   tmp5        = mktemp ("tmp$abn")
+   l_log       = mktemp ("tmp$abn")
+   im1         = uniq // "_im1"
+   im2         = uniq // "_im2"
+   im3         = uniq // "_im3"
+
+   if (nflat != "null" && !imaccess(nflat)) {
+      print ("Flatfield image ",nflat, " does not exist!")
+      goto skip
+   } else if ((stridx("@%.",out) != 1) && (stridx(",",out) <= 1)) {
+# Verify format of output descriptor
+      print ("Improper output descriptor format: ",out)
+      print ("  Use @list or comma delimited list for fully named output")
+      print ("  Use .extension for appending extension to input list")
+      print ("  Use %inroot%outroot% to substitute string within input list")
+      goto skip
+   } else if (fixpix && !access(badpix)) {
+      print ("FIXPIX file ",badpix," does not exist!")
+      goto skip
+   } else if (setpix && !imaccess(maskimage)) {
+      print ("SETPIX mask_image ",maskimage, " does not exist!")
+      goto skip
+   }
+
+# check whether input stuff exists
+
+   print (in) | translit ("", "@:", "  ") | scan(in1,in2)
+   if ((stridx("@",in) == 1) && (! access(in1))) {	# check input @file
+      print ("Input file ",in1," does not exist!")
+      goto skip
+   }
+   
+   sqsections (in,option="nolist")
+   if (sqsections.nimages == 0) {			# check input images
+      print ("Input images in file ",in, " do not exist!")
+      goto skip
+   }
+   if (imaccess(out)) {				# check for output collision
+      print ("Output image",out, " already exists!")
+      goto skip
+   }
+
+# Expand input file name list
+#   option="root" truncates lines beyond ".imh" including section info
+
+   sqsections (in, option="root") | match ("\#",meta+,stop+,print-,> infile)
+   l_list = l_log
+# Expand output image list
+   if (stridx("@,",out) != 0) { 		# @-list
+# Output descriptor is @-list or comma delimited list
+      sections (out, option="root",> outfile)
+   } else {					# namelist/substitution/append
+      inlist = infile
+      for (nin = 0; fscan (inlist,img) !=EOF; nin += 1) {
+# Get past any directory info
+         if (stridx("$/",img) != 0) {
+            print (img) | translit ("", "$/", "  ", >> l_log)
+            stat = fscan(l_list,img,img,img,img,img,img,img,img)
+         }
+         i = strlen(img)
+         if (substr(img,i-nex,i) == "."//gimextn)	# Strip off imextn
+            img = substr(img,1,i-nex-1)
+# Output descriptor indicates append or substitution based on input list
+         if (stridx("%",out) > 0) { 			# substitution
+            print (out) | translit ("", "%", " ") | scan(iroot,oroot)
+            if (nscan() == 1) oroot = ""
+            irootlen = strlen(iroot)
+            while (strlen(img) >= irootlen) {
+               found = no
+               pos2b = stridx(substr(iroot,1,1),img)	# match first char
+               pos2e = pos2b + irootlen - 1 		# presumed match end
+               pos1e = strlen(img)
+               if ((pos2b > 0) && (substr(img,pos2b,pos2e) == iroot)) {
+                  if ((pos2b-1) > 0) 
+                     sjunk = substr(img,1,pos2b-1)
+                  else
+                     sjunk = ""
+                  print(sjunk//oroot//
+                     substr(img,min(pos2e+1,pos1e),pos1e), >> outfile)
+                  found = yes
+                  break
+               } else if (pos2b > 0) {
+                  img = substr(img,pos2b+1,pos1e)    # move past first match
+               } else { 				# no match
+                  found = no
+                  break
+               }
+            }
+            if (! found) { 				# no match
+               print ("root ",iroot," not found in ",img)
+               goto skip
+            }
+         } else					# name/append
+            print(img//out,>> outfile)
+      }
+   }
+
+   count(infile) | scan(pos1b)
+   count(outfile) | scan(pos2b)
+   if (pos1b != pos2b) {
+      print ("Mismatch between input and output lists: ",pos1b,pos2b)
+      join (infile,outfile)
+      goto skip
+   }
+   nin = pos1b
+   inlist = ""
+   
+# Start logging info
+   delete (tmp1, ver-, >& "dev$null")
+# send newline if appending to existing logfile
+   if (access(logfile)) print("\n",>> tmp1)
+# Get date
+   time() | scan(line)
+# Print date and id line
+   print (line," MOVPROC: ",>> tmp1)
+#   print ("SUBTRACTED BLANK= ",skyimg,>> tmp1)
+   print ("FLATFIELD= ",nflat,>> tmp1)
+   print ("imagelist: ",nin,"images",>> tmp1)
+   join (outfile,infile, >> tmp1)
+   if (fixpix)  print ("FIXPIX according to ", badpix, " file",>> tmp1)
+   if (setpix) {
+       print ("SETPIX to ",svalue," using ", maskimage," mask",>> tmp1)
+   }
+   if (orient) print("Orient SQIID: channel dependent",>> tmp1)
+   print("Statistics for data within ", lthreshold, " to ", hthreshold,
+      " in section ",statsec, >> logfile)
+   imstatistics ("", fields="image,npix,mean,midpt,mode,stddev,min,max",
+         lower=lthreshold,upper=hthreshold,binwidth=0.001,format+,>> tmp1)
+   if (verbose && logfile != "STDOUT") type(tmp1)
+   type (tmp1,>> logfile)
+   delete (tmp1, ver-, >& "dev$null")
+   
+if(debug) {##DEBUG      
+   count(in) | scan(nin)
+   copy(in, infile)
+   copy(out, outfile)
+   print(nin,include,improc,imskip)
+}##DEBUG
+
+# Loop through data
+   img_num = 0
+   gnum    = 0
+   l_list = ""; delete (tmp1, verify-,>& "dev$null")
+   inlist = infile; outlist = outfile
+   copy (infile, tmp2)
+   while ((fscan (inlist,sname) != EOF) && (fscan(outlist,sout) != EOF)) {
+   
+      img_num += 1
+      if (img_num < first_proc)
+         next  # skip until appropriate list number      
+      if (((img_num > last_proc)  || (img_num > nin)))
+         break # terminate
+      
+      sub_num = ((img_num - first_proc) % (improc+imskip))
+      if (sub_num == 0)
+         gnum +=1
+	 
+#      if (verbose) print (sub_num)
+      	 	 
+if(debug) {##DEBUG
+   print(img_num, gnum, ((img_num - first_proc) % improc),
+         (first_proc + gnum*improc-1),
+         (first_proc + gnum*(improc+imskip)-1),
+         (first_proc + (gnum-1)*improc-1),
+         (first_proc + (gnum-1)*(improc+imskip)),
+         (first_proc + gnum*(improc)+(gnum-1)*imskip-1))
+}##DEBUG
+
+      if ((img_num > (first_proc + gnum*improc + (gnum-1)*imskip - 1))) {
+          next  # skip until appropriate list number
+      }
+      
+# Get raw_median value for header
+      imstatistics (sname//statsec,fields="midpt,mean",
+         lower=lthreshold,upper=hthreshold,binwidth=0.001,format-) |
+         scan (rawmedian)
+
+      if (verbose) print ("# list_number: ",img_num,sname)
+       
+# Subtract the blank image from the raw data images.
+
+      first_in = first_proc + (gnum - 1)*improc
+      last_in  = first_in + improc - 1
+      
+#         first_in = img_num - int((include/2))
+#         last_in  = int((include + 1)/2) + img_num
+
+      if (first_in < 1) {
+         last_in += (1 - first_in)
+         first_in = 1
+      } else if (last_in > nin) {
+         first_in -= (last_in - nin)
+         last_in = nin
+      }
+     
+      if (notch) {
+         print ("# ",sub_num," compute sky from:  ",img_num,first_in,last_in)
+         imglist = tmp2
+         for (ilist = 1; fscan(imglist,img) != EOF; ilist += 1) {
+            if (ilist > last_in) break
+            if ((ilist >= first_in) && (ilist != img_num)) {
+               print(img,>> tmp3)
+if(debug) print("sky: ",img) ##DEBUG
+            }
+         }
+         imcombine("@"//tmp3,im3,sigma="",logfile=logfile,
+            combine=combopt,reject=reject,project-,outtype="real",
+            offsets="none",masktype="none",maskvalue=0,blank=bvalue,
+            scale=scaleopt,zero=zeroopt,weight=weight,statsec=statsec,
+            lthreshold=lthreshold,hthreshold=hthreshold,
+            nlow=nlow,nhigh=nhigh,nkeep=nkeep,mclip=mclip,lsigma=lsigma,
+            hsigma=hsigma,expname=expname,rdnoise=rdnoise,gain=gain,
+            sigscale=sigscale,snoise=snoise,pclip=pclip,grow=grow)
+         imarith (sname,"-",im3,im1,pixtype="r",calctype="r",hparams="")
+         delete (tmp3,verify-); imdelete (im3,verify-,>& "dev$null")	  
+      } else {
+         imglist = tmp2
+	 imprior = "none"; imnext = "none"; imobj = "none"
+         for (ilist = 1; fscan(imglist,img) != EOF; ilist += 1) {
+            if ((ilist > last_in) || (ilist > (img_num + 2))) break
+	    if (ilist == img_num) imobj = img
+	    if (ilist == (img_num - 1)) imprior = img
+	    if (ilist == (img_num + 1)) imnext = img
+         }
+	 
+	 if (sub_num == 0)
+	    imsky = imnext
+	 else if ((sub_num % 2) == 1)
+	    imsky = imnext
+	 else 
+	    imsky = imprior
+	    
+	 if (imsky == "none")
+	    imsky = imprior
+	       
+	 if (imsky == "none") {
+	    print ("Warning: no sky for ",imobj)
+	    goto skip # gracefully exit from no sky situation
+	 } else if (imsky == imobj) {
+	    print ("Warning: sky and obj same for ",imobj)
+	    goto skip # gracefully exit situation
+	 }
+	 	    	 
+         if (verbose) {
+	    print ("# ",sub_num," image number: ",img_num," ; object is ",imobj,
+	           " ; sky is ",imsky)
+	 }
+	 print ("# ",sub_num," image number: ",img_num," ; object is ",imobj,
+	        " ; sky is ",imsky,>> logfile)
+	 imarith (imobj,"-",imsky,im1,pixtype="r",calctype="r",hparams="")	
+      }
+
+# Assume rest is uniform illumination and divide by flat
+      if (nflat != "null")
+         imarith (im1,"/",nflat,im1,pixtype="r",calctype="r",hpar="")
+      imstatistics (im1//statsec,
+         fields="npix,mean,midpt,mode,stddev,min,max",
+         lower=lthreshold, upper=hthreshold, binwidth=0.01, format-,>> tmp1)
+      if(verbose) type (tmp1,>> logfile)
+      l_list = tmp1 
+      stat = fscan (l_list,sjunk,rmean,rmedian,rmode,rsdev)
+      l_list = ""; delete (tmp1, verify-)
+
+# FIXPIX
+      if (fixpix) fixpix(im1, badpix, verbose-)
+
+# SETPIX
+      if (setpix) {
+# replace bad pixels with selected value
+         imexpr("a==0?b:c",sout,maskimage,svalue,im1,dims="auto",
+	    outtype="real",verbose-)
+      } else
+         imcopy (im1, sout, verbose-,>> logfile)        
+
+# ORIENT     
+# imtranspose [*,-*] rotate 90 counter-clockwise (ABU at South Pole)
+# imtranspose [-*,*] rotate 90 clockwise
+# imcopy      [-*,-*] rotate 180
+# imcopy      [-*,*] flip about (vertical) y-axis
+# imcopy      [*,-*] flip about (horizontal) x-axis (SQIID)
+
+      if (orient) chorient(sout,channels=".",newid="")
+
+      hedit (sout,"title",sout,add-,delete-,verify-,show-,update+)
+      hedit (sout,"raw_midpt",rawmedian,add+,delete-,verify-,show-,update+)
+      hedit (sout,"pro_midpt",rmedian,add+,delete-,verify-,show-,update+)
+      imglist = ""; imdelete (im1//","//im3, verify-,>& "dev$null")
+ 
+      
+      if (qfilter != "" && qfilter != " " && filter != "" && filter != " ") {
+         hedit (sout,qfilter,filter,add+,delete-,verify-,show-,update+) 
+      }
+      if (qstarid != "" && qstarid != " " && starid != "" && starid != " ") {
+         hedit (sout,qstarid,starid,add+,delete-,verify-,show-,update+) 
+      }
+	     
+      if (docenter) {
+         imstatistics (sout//findsub,
+	    fields="npix,mean,midpt,mode,stddev,min,max",
+            lower=lthreshold, upper=hthreshold, binwidth=0.01, format-,>> tmp1)
+         if(verbose) type (tmp1,>> logfile)
+         l_list = tmp1 
+         stat = fscan (l_list,sjunk,rmean,rmedian,rmode,rsdev)
+         l_list = ""; delete (tmp1, verify-,>& "dev$null")
+         rmin = rmedian - rsdev
+
+         daofind (sout//findsub, output=tmp4, verify-, interactive-,
+	    fwhmpsf=5, emission+, sigma=rsdev, datamin=rmin,
+	    threshold=fthreshold)
+	 if (verbose) type (tmp4,>> logfile)
+	 txdump (tmp4, "XCENTER,YCENTER,MAG,ID", yes, >> tmp1)
+	 stat = 0; l_list = tmp1
+	 while (fscan(l_list,xcen,ycen,rmag,stat) != EOF) {
+	    xcen = xcen + nxlo - 1
+	    ycen = ycen + nylo - 1	    
+	    print (xcen,ycen,stat,>> tmp5)
+	    print (xcen,ycen,stat,>> logfile)
+	 }
+	  
+	 if (stat == 1) {
+	    hedit (sout,"XCENTER",xcen,add+,delete-,verify-,show-,update+)
+	    hedit (sout,"YCENTER",ycen,add+,delete-,verify-,show-,update+)
+            if (dophot) {    
+	       qphot(sout,qcbox,qannulus,qdannulus,qapertures,coords=tmp5,
+	          zmag=qzmag, exposure=qexposure, airmass=qairmass,
+		  filter=qfilter, output="default",
+		  inter-,radplots-,verbose-, icommands="", gcommands="")
+# txdump
+#   textfiles = "*.mag.2"       Input apphot/daophot text database(s)
+#       fields = "IMA,XCEN,YCEN,ITIME,XAIR,MAG" Fields to be extracted
+#         expr = "yes"           Boolean expression for record selection
+#     (headers = no)             Print the field headers ?
+#  (parameters = no)            Print the parameters if headers is yes ?
+	    }
+	 } else if (stat == 0) {
+	    if (verbose) print ("Warning: no objects found in ", sout//findsub)
+	    print ("Warning: no objects found in ",sout//findsub,>> logfile)    	     
+	 } else {
+	    if (verbose) {
+	       print ("Warning: too many objects found in ",sout//findsub)
+	    }
+	    print ("Warning: too many objects found in ",sout//findsub,
+	       >> logfile)
+         }
+	 l_list = ""
+	 delete (tmp1//","//tmp4//","//tmp5, verify-,>& "dev$null" )	 	 
+      }
+   }
+   
+skip:
+
+# Finish up
+inlist = ""; outlist = ""; imglist = ""; l_list = ""
+imdelete (im1//","//im2//","//im3, verify-, >& "dev$null")
+delete (tmp1//","//tmp2//","//tmp3//","//tmp4//","//tmp5, verify-,>& "dev$null")
+delete (infile//","//outfile//","//l_log, verify-, >& "dev$null")
+   
+end

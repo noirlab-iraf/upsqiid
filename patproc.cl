@@ -1,0 +1,681 @@
+# PATPROC: 23MAR02 KMM expects IRAF 2.11Export or later
+# PATPROC: -- pattern process raw image data generated from the following
+#             protocols (+ = on|object; - = off|sky):
+#                  all_on:  + + + + +   order=1
+#                    pair:  +- +- +-    order=2
+#                   triad:  +-+ +-+     order=3
+#                    quad:  +--+ +--+   order=4
+#                alt-quad:  -++- -++-   order=5
+#               alt-triad:  -++ -++     order=6
+#             skyimage choices: 
+#               valid_image_name : use this image as basis for blank image
+#                "null"          : don't subtract any blank image
+#                "make_all"      : make sky from all images
+#                "make_off"      : make sky from all off images
+#                "make_order"    : make sky from order selected off field
+#                                    neighbor(s)
+# SQPROC: 06APR92 KMM
+#         22MAR93 KMM
+#         21JUN94 KMM added int_time and delay_time parameters
+#         04AUG94 KMM added header keyword for blank value statistic
+#         08AUG94 KMM Replace fscan with scan from pipe at key spots
+#         12AUG94 KMM fix access test for maskimage and scaleimage
+# IMPROC: 02JAN95 KMM support for typical image order protocols
+#         11JUL95 KMM misc minor changes
+# IMPROC: 22JUN98 KMM add global image extension
+#                     replace access with imaccess where appropriate
+# IMPROC: 25JUL98 KMM incorporate imexpr into setpix option
+# IMPROC: 31JUL98 KMM eliminate STSDAS table package dependencies
+#                     tailor for abu (including removing color offsetting)
+# PATPROC: 03AUG98 KMM rename as PATPROC
+#                      add alternative quad processing -++- and
+#                          alternative triad processing -++
+# PATPROC: 08AUG98 KMM modify to implement new STATELIST options:
+#                           new STATELIST variable output "format"
+#                           when state = "obj|on|off|sky"
+#                              if format = 1name   on|off
+#                              if format = group   on|off, group#
+#                              else                on|off, group#, list#
+#                           when state = "op"
+#                              if format = 1name   on, nearest off
+#                              if format = 2name   on, nearest 2 offs
+#                              if format = group   on, nearest 2 offs, group#
+#                              else on, nearest 2 offs, group#, list#
+#                      enable multiple images at each +|- state
+# PATPROC: 03MAR99 KMM replace reference to SQSKY with ABUSKY
+# PATPROC: 02APR99 KMM replace ABUSKY with IMCOMBINE; enable dark subtraction
+# PATPROC: 14MAY99 KMM fix dark substraction
+# PATPROC: 22JAN00 KMM modify for UPSQIID including channel offset syntax
+# PATPROC: 17MAY00 KMM change default for sec_norm to [100:400,100:400]
+#                        fix setpix by incorpating svale parameter
+#                      modify orient to use chorient for SQIID
+#          25MAR02 KMM changes to imcombine parameters for IRAF 2.12
+
+procedure patproc (input, output, flatimage, skyimage)
+
+string input       {prompt="Input raw images"}
+string output      {prompt="Output image descriptor: @list||.ext||%in%out%"}
+string flatimage   {prompt="Input flat field image name"}
+string skyimage    {prompt="Input blank field image choice"}
+
+   # vaid_image_name: use this image as basis for blank image
+   # null           : don't subtract blank image
+   # make_all       : make sky from all images
+   # make_off       : make sky from all off images
+   # make_order     : make sky from order selected off field neighbor(s)
+   
+string darkimage   {"null",prompt='Input dark_count image ("null"==noaction)'}
+int    order       {1, min=1, max=6,
+                   prompt="Pattern # 1:++ 2:+- 3:+-+ 4:+--+ 5:-++- 6:-++ ?"}
+int    multiple    {1, prompt="# of frames at each +/- pattern state?"}
+                            		    
+string seq_id      {"none",
+                      prompt='Sequential imager id template? (eg, ".00"|"000")'}
+   # Model: image_name == imroot//seq_id//"."//imextn
+   #      where seq_id == seq_mark//seq_number
+   		                        
+string rescale_opt {"none",enum="none|mean|median",
+                      prompt="Rescale blank to object via: |none|mean|median|"}
+string sec_norm    {"[100:400,100:400]",
+                     prompt="Image section for calculating statistics"}
+bool   save_blank  {no, prompt="Save generated blank_frames?"}		     
+## inactive parameters		     
+# real   int_time    {0.00,prompt="Integration_time"}
+# real   delay_time  {0.00,prompt="Delay_time"}
+# int    include    {0, prompt="Number of included images in blankimage subset"}
+# int    improc     {0, prompt="Number of images to process in group"}
+# int    imskip     {0, prompt="Number of images to skip between process"}
+# int    first_proc {1, prompt="List number of first image to be processed"}
+# int    last_proc  {1000, prompt="List number of last image to be processed"}
+## inactive parameters
+bool   fixpix      {no,prompt="Run FIXPIX on data?"}
+string badpix      {"badpix", prompt="badpix file in FIXPIX format"}
+bool   setpix      {no,prompt="Run SETPIX on data?"}
+string maskimage   {"badmask", prompt="untransposed bad pixel image mask"}
+real   svalue      {-1.0e7, prompt="Setpix value (far below lthreshold)"}
+real   bvalue      {0., prompt="Value if there are no pixels"}
+bool   orient      {no,prompt="Orient image with N up and E left?"}
+bool   verbose     {yes,prompt="Verbose output?"}
+file   logfile     {"STDOUT",prompt="logfile name"}
+
+# IMCOMBINE parameters
+string comb_opt   {"median", enum="average|median",
+                       prompt="Type of combine operation: |average|median|"}
+string reject_opt {"none", prompt="Type of pixel rejection operation",
+                    enum="none|minmax|ccdclip|crreject|sigclip|avsigclip|pclip"}
+string norm_opt   {"zero", enum="zero|scale|none",
+                      prompt="Type of pre-combine operation: |zero|scale|none|"}
+string norm_stat  {"median",enum="none|mean|median|mode",
+                  prompt="Pre-combine common statistic: |none|mean|median|mode"}  
+bool   mclip      {no, prompt="Use median, not mean, in clip algorithms"}
+real   pclip      {-0.5, prompt="pclip: Percentile clipping parameter"}
+real   lthreshold {INDEF,prompt="Lower threshold for exclusion in statistics"}
+real   hthreshold {INDEF,prompt="Upper threshold for exclusion in statistics"}
+string weight     {"none",prompt="Image weights"}
+string expname    {"", prompt="Image header exposure time keyword"}
+int    nlow       {1, prompt="minmax: Number of low pixels to reject"}
+int    nhigh      {1, prompt="minmax: Number of high pixels to reject"}
+int    nkeep      {0, prompt="Min to keep (pos) or max to reject (neg)"}
+real   lsigma     {3., prompt="Lower sigma clipping factor"}
+real   hsigma     {3., prompt="Upper sigma clipping factor"}
+string rdnoise    {"0.", prompt="ccdclip: CCD readout noise (electrons)"}
+string gain       {"1.", prompt="ccdclip: CCD gain (electrons/DN)"}
+string snoise     {"0.", prompt="ccdclip: Sensitivity noise (fraction)"}
+real   sigscale   {0.1,
+                     prompt="Tolerance for sigma clipping scaling correction"}
+int    grow       {0, prompt="Radius (pixels) for 1D neighbor rejection"}
+   
+struct  *inlist,*l_list,*offlist
+
+begin
+
+   int    nin, nim, irootlen, orootlen, stat, pos1b, pos1e, pos2b, pos2e,
+          nxlotrim,nxhitrim,nylotrim,nyhitrim, ncols, nrows, on_grp0, on_grp,
+	  off_grp, off_grp0, noff, nseq
+   real   rnorm, rmean, rmedian, rmode,
+          objave,objmid,objmode,objnorm,skyave,skymid,skymode,skynorm
+   string in,in1,in2,out,iroot,oroot,uniq,img,sname,sout,sbuff,sjunk,sky,
+          skyid, smean, smedian, smode, srcsub, sky1, sky2, sobj, spat,
+	  reject, combopt, optzero, normstat, optscale,
+	  seqnum, imseq, seqmark, seqid, dark
+   file   imsky,  imsky0, nflat, infile, outfile, im1, im2, im3, tmp1, tmp2,
+          onfile, offfile, opfile, scaleimg, subfile
+   bool   found, make_blank, last_sky, last_done, sub_dark
+   bool   debug = no
+   int    nex
+   string gimextn, imname, imextn, imroot
+
+   struct line = ""
+
+# Assign positional parameters to local variables
+   in          = input
+   out         = output
+   nflat       = flatimage
+   skyid       = skyimage
+   imsky       = skyid
+   dark        = darkimage
+
+   if (seq_id == "" || seq_id == "none" || seq_id == " ")
+      seqid = "none"
+   else
+      seqid = seq_id
+   nseq = strlen(seqid)
+   seqmark = ""
+   print (seq_id) | translit ("","0-9"," ",delete-,collapse-) | scan (seqmark)
+
+# get IRAF global image extension
+   show("imtype") | translit ("",","," ",delete-) | scan (gimextn)
+   nex     = strlen(gimextn)
+
+   uniq        = mktemp ("_Timp")
+   infile      = mktemp ("tmp$imp")
+   outfile     = mktemp ("tmp$imp")
+   opfile      = mktemp ("tmp$imp")
+   onfile      = mktemp ("tmp$imp")
+   offfile     = mktemp ("tmp$imp")
+   subfile     = mktemp ("tmp$imp")
+   tmp1        = mktemp ("tmp$imp")
+   tmp2        = mktemp ("tmp$imp")
+   im1         = uniq // "_im1"
+   im2         = uniq // "_im2"
+   im3         = uniq // "_im3"
+
+   reject   = reject_opt
+   combopt  = comb_opt
+   normstat = norm_stat
+   if (norm_opt == "zero") {
+      optscale  = "none"
+      optzero   = normstat
+   } else if (norm_opt == "scale") {
+      optscale  = normstat
+      normstat  = normstat
+      optzero   = "none"
+   } else {
+      optscale  = "none"
+      optzero   = "none"
+      normstat  = "none"
+   }
+   
+# check whether input stuff exists
+   if(skyid == "make_all" || skyid == "make_off" || skyid == "make_order")
+      make_blank = yes
+   else
+      make_blank = no
+      
+   if (dark != "null" && dark != "" && dark != " ")
+      sub_dark = yes
+   else
+      sub_dark = no
+      
+   if (nflat != "null" && !imaccess(nflat)) {
+      print ("Flatfield image ",nflat, " does not exist!")
+      goto skip
+   } else if ((imsky != "null") && !make_blank && !imaccess(imsky)) {
+      print ("Blank image ",imsky, " does not exist!")
+      goto skip
+   } else if ((stridx("@%.",out) != 1) && (stridx(",",out) <= 1)) {
+# Verify format of output descriptor
+      print ("Improper output descriptor format: ",out)
+      print ("  Use @list or comma delimited list for fully named output")
+      print ("  Use .extension for appending extension to input list")
+      print ("  Use %inroot%outroot% to substitute string within input list")
+      goto skip
+   } else if (sub_dark && !imaccess(dark)) {
+      print ("Dark image ",dark, " does not exist!")
+      goto skip
+   }
+   
+   if (setpix && !imaccess(maskimage)) {
+      print ("SETPIX maskimage ",sjunk, " does not exist!")
+      goto skip
+   } else if (fixpix && !imaccess(badpix)) {
+      print ("FIXPIX file ",badpix," does not exist!")
+      goto skip
+   }
+
+# check whether input stuff exists
+   print (in) | translit ("", "@:", " ") | scan(in1,in2)
+   if ((stridx("@",in) == 1) && (! access(in1))) {	# check input @file
+      print ("Input file ",in1," does not exist!")
+      goto skip
+   }
+   sqsections (in,option="nolist")
+   if (sqsections.nimages == 0) {			# check input images
+      print ("Input images in file ",in, " do not exist!")
+      goto skip
+   }
+        
+   if (access(out)) {				# check for output collision
+      print ("Output image",out, " already exists!")
+      goto skip
+   }
+   
+   switch (order) {
+      case 1:
+         spat = "all_on:  + + + + +   order=1"
+      case 2:
+         spat = "pair:  +- +- +-    order=2"
+      case 3: 
+         spat = "triad:  +-+ +-+     order=3"
+      case 4:	 
+         spat = "quad:  +--+ +--+   order=4"
+      case 5:	 
+         spat = "alt-quad:  -++- -++-   order=5"
+      case 6:	 
+         spat = "alt-triad:  -++ -++     order=6"
+   }
+# Expand input file name list
+#   option="root" truncates lines beyond imextn including section info
+   sqsections (in, option="root",> infile)
+# Handle dark subtraction
+   if (sub_dark) {
+      l_list = infile
+      print ("Subtracting dark ",dark)
+      for (nin = 0; fscan (l_list,img) !=EOF; nin += 1) {
+          sname = uniq//"_"//nin
+          print (sname,>> subfile)
+	  imarith (img,"-",dark,sname,pix="",calc="",hparam="")
+      }
+      l_list = ""
+# Generate list of off frames      
+      statelist ("@"//subfile, order=order, state= "off", multiple=multiple,
+         format="group",>> offfile)
+# Generate operation file
+      statelist ("@"//subfile, order=order, state= "op", format="group",
+         multiple=multiple,>> tmp2)      
+   } else {
+# Generate list of off frames      
+      statelist ("@"//infile, order=order, state= "off", multiple=multiple,
+         format="group",>> offfile)
+# Generate operation file
+      statelist ("@"//infile, order=order, state= "op", format="group",
+         multiple=multiple,>> tmp2)
+   }
+# Generate list of on frames
+   statelist ("@"//infile, order=order, state= "on", multiple=multiple,
+      format="group",>> onfile)
+      
+if(debug) {##DEBUG
+   type(onfile) 
+   type(offfile) 
+}##DEBUG
+     
+# Generate list of output images
+# Expand output image list
+   if (stridx("@,",out) != 0) { 		# @-list or comma delimited
+      sqsections (out, option="root",> outfile)
+   } else {					# namelist/substitution/append
+      inlist = onfile
+      for (nin = 0; fscan (inlist,img) !=EOF; nin += 1) {
+# Get past any directory info
+         while (stridx("$/",img) != 0) {
+            img = substr(img,stridx("$/",img)+1,strlen(img))
+         }
+         if (substr(img,strlen(img)-nex,strlen(img)) == "."//gimextn ) {
+            imroot = substr(img,1,strlen(img)-nex-1)
+	 } else
+	    imroot = img 
+	    
+# Output descriptor indicates append or substitution based on input list
+         img = imroot
+         if (stridx("%",out) > 0) { 			# substitution
+            print (out) | translit ("", "%", " ") | scan(iroot,oroot)
+            if (nscan() == 1) oroot = ""
+            irootlen = strlen(iroot)
+            while (strlen(img) >= irootlen) {
+               found = no
+               pos2b = stridx(substr(iroot,1,1),img)	# match first char
+               pos2e = pos2b + irootlen - 1 		# presumed match end
+               pos1e = strlen(img)
+               if ((pos2b > 0) && (substr(img,pos2b,pos2e) == iroot)) {
+                  if ((pos2b-1) > 0) 
+                     sjunk = substr(img,1,pos2b-1)
+                  else
+                     sjunk = ""
+                  print(sjunk//oroot//
+                     substr(img,min(pos2e+1,pos1e),pos1e), >> outfile)
+                  found = yes
+                  break
+               } else if (pos2b > 0) {
+                  img = substr(img,pos2b+1,pos1e)    	# move past first match
+               } else { 				# no match
+                  found = no
+                  break
+               }
+            }
+            if (! found) { 				# no match
+               print ("root ",iroot," not found in ",img)
+               goto skip
+            }
+         } else						# name/append
+            print(img//out,>> outfile)
+      }
+      inlist = ""
+   }
+   count(infile) | scan(nin)
+   count(onfile) | scan(pos1b)
+   count(outfile) | scan(pos2b)
+   if (pos1b != pos2b) {
+      print ("Mismatch between input and output lists: ",pos1b,pos2b)
+      goto skip
+   }
+   join (outfile,tmp2,output=opfile,delim=" ",maxchar=161,short+,verb+)
+   delete (tmp2, ver-, >& "dev$null")
+
+if(debug) type(opfile) ##DEBUG
+   
+## LOG update
+   delete (tmp1, ver-, >& "dev$null")  
+# Send newline if appending to existing logfile
+   if (access(logfile)) print("\n",>> tmp1)
+# Get date
+   time() | scan(line)
+# Print date and id line
+   print (line," PATPROC: ",>> tmp1)
+   print ("PATTERN ",spat,>> tmp1)
+   print ("SUBTRACTED BLANK: ",skyid,>> tmp1)
+   print ("SUBTRACTED DARK: ",dark,>> tmp1)
+   print ("FLATFIELD: ",nflat,>> tmp1)
+   print ("Submitted imagelist: ",nin,"images",>> tmp1)
+   print ("Processing data by subtracting ",skyid," and dividing by ",nflat,
+      >> tmp1)
+   if (fixpix)  print ("FIXPIX according to ", badpix, " file",>> tmp1)
+   if (setpix) {
+       print ("SETPIX to ",svalue," using ", maskimage," mask",>> tmp1)
+   }
+   if (orient) print("Orient SQIID: channel dependent",>> tmp1)
+   if (rescale_opt != "none") {
+      print ("Will rescale skyimage= ",skyid," to make sky",>> tmp1)
+   }
+   join (outfile,onfile, >> tmp1)
+   print("Statistics for data within ", lthreshold, " to ", hthreshold,
+      " within section ",sec_norm, >> tmp1)    
+   imstatistics ("", fields="image,npix,mean,midpt,mode,stddev,min,max",
+         lower=lthreshold,upper=hthreshold,binwidth=0.001,format+,>> tmp1)	             
+## Output prleiminary log         
+   if (verbose && logfile != "STDOUT") type(tmp1)
+   type(tmp1,>> logfile)
+   delete (tmp1, ver-, >& "dev$null")
+         	 
+# Generate single blank image name applicable to entire data set
+   if (make_blank) {
+      if (stridx("@",in) !=0 ) {		# it's an @-list
+         print (in) | translit ("", "@.", " ") | scan(in1,in2)
+         img = in1   
+         while (stridx("$/",img) != 0) {
+            img = substr(img,stridx("$/",img)+1,strlen(img))
+         }
+      } else {
+         print (in) | translit ("", ".*?:", " ") | scan(in1,in2)
+         img = in1   
+         while (stridx("$/",img) != 0) {
+            img = substr(img,stridx("$/",img)+1,strlen(img))
+         }
+      }
+      imsky = "blank_"//img			# create a name
+   }
+   
+# Generate single blank image applicable to entire data set
+   if (make_blank && (skyid != "make_order")) {
+      if (skyid == "make_off") {
+	     sjunk = offfile
+      } else if (skyid == "make_all") {
+         if (sub_dark) {
+	        sjunk = subfile
+	     } else {
+	        sjunk = infile
+	     }
+      }
+# Allow choice of norm_opt
+#      abusky ("@"//sjunk,im3,dark=dark,norm_opt=norm_opt,norm_stat="median",
+#         comb_opt="median",reject_opt="none",statsec=sec_norm,
+#         lthresh=lthreshold, hthresh=hthreshold, mclip-,weight="none",
+#         logfile=logfile)
+#      abusky ("@"//sjunk,im3,dark=dark,norm_opt=norm_opt,norm_stat=normstat,
+#         comb_opt=combopt,reject_opt=reject,statsec=sec_norm,
+#         lthresh=lthreshold,hthresh=hthreshold,blank=bvalue,weight=weight,
+#	 mclip=mclip,pclip=pclip,nlow=nlow,nhigh=nhigh,nkeep=nkeep,
+#	 lsigma=lsigma,hsigma=hsigma,
+#	 expname=expname,rdnoise=rdnoise,gain=gain,sigscale=sigscale,
+#         snoise=snoise,grow=grow,logfile=logfile)
+    imcombine("@"//sjunk,im3,sigma="",logfile=logfile,
+	  combine=combopt,reject=reject,project-,outtype="real",
+	  offsets="none",masktype="none",maskvalue=0,blank=bvalue,
+	  scale=optscale,zero=optzero,weight=weight,
+	  statsec=sec_norm,lthreshold=lthreshold,
+	  hthreshold=hthreshold,nlow=nlow,nhigh=nhigh,nkeep=nkeep,
+	  mclip=mclip,lsigma=lsigma,hsigma=hsigma,expname=expname,
+	  rdnoise=rdnoise,gain=gain,sigscale=sigscale,
+	  snoise=snoise,pclip=pclip,grow=grow)
+      if (save_blank) {
+         imcopy (im3,imsky)
+      }
+   }
+
+# Only calculate statistics once if common blank is used
+   if (skyid != "null" && skyid != "make_order") {
+      imstatistics (im3//sec_norm,
+         fields="image,npix,mean,midpt,mode,stddev,min,max",
+         lower=lthreshold,upper=hthreshold,binwidth=0.001,format+,>> logfile)
+      imstatistics (im3//sec_norm,fields="mean,midpt,mode",lower=lthreshold,
+         upper=hthreshold,binwidth=0.001,format-) |
+         scan (skyave,skymid,skymode)
+   } else {
+       skyave  = 1.0
+       skymid  = 1.0
+       skymode = 1.0
+   }
+
+# Loop through data
+   inlist = opfile
+   offlist = offfile
+   on_grp0 = 0
+   last_sky = no
+   imsky0 = ""
+   for (nim = 1; fscan (inlist,sout,sobj,sky1,sky2,on_grp) != EOF; nim +=1) {
+   
+if(debug) print(sout," ",sobj," ",sky1," ",on_grp,on_grp0) ##DEBUG   
+
+      if (make_blank) {
+         if (skyid == "make_order") {
+	    if (multiple == 1) {	# fetch sky frame from ordered list
+               sky = sky1
+if(debug) print ("Using sky: ",sky) ##DEBUG	       
+if(!debug){##DEBUG
+               imstatistics (sky//sec_norm,
+                  fields="mean,midpt,mode,stddev,min,max,npix,image",
+                  lower=lthreshold, upper=hthreshold, binwidth=0.001,
+	          format-,>> tmp1)  
+               if (verbose) type (tmp1,>> logfile)
+               l_list = tmp1 
+               stat = fscan (l_list,skyave,skymid,skymode)
+               l_list = ""; delete (tmp1, verify-)
+}##DEBUG
+	    } else {			# generate sky frame from offlist
+
+# Logic: want new skies at the beginning for all cases and each time a new group
+#        of on frames is encountered unless alt_triad -++ -++ or triad +-+ +-+.
+#        These cases want new skies every other group after the second.
+#                        1 2 3 4 5 6 7 8
+#               all_on:  + + + + + + + +   order=1
+#                 pair:  + - + - + - + -   order=2
+#                triad:  + - + + - + + -   order=3
+#                 quad:  + - - + + - - +   order=4
+#             alt-quad:  - + + - - + + -   order=5
+#            alt-triad:  - + + - + + - +   order=6
+#        Listed group# is sequential out of STATELIST with state = "op".
+
+               if ((on_grp != on_grp0) && !last_sky &&
+	           ((nim == 1) ||
+		    (order != 6 && order != 3) ||
+		    ((order == 3) && (on_grp % 2 == 1)) ||
+		    ((order == 6) && (on_grp % 2 == 0)) ) ) {
+                  if (verbose) print("Generate new sky from:")
+	          delete (tmp2, verify-, >& "dev$null")	
+	          for (noff=1;noff <=multiple; noff+=1) {
+		     stat = fscan(offlist,sky1,off_grp)
+                     if (stat !=2 ) { # hit EOF
+		        noff = noff - 1
+                        print ("NOTE: hit EOF after ",noff,"of ",
+			   multiple," skies...")
+			last_sky = yes
+                        break
+                     } else { 
+         	        print (sky1,>> tmp2)
+			if (verbose) print(sky1)
+	             }
+		     imparse(sky1,imoption="full",seq_id=seq_id) |
+		         scan (img,imextn,seqnum)
+		     while (stridx("$/",img) != 0) {
+                        img = substr(img,stridx("$/",img)+1,strlen(img))
+                     }
+		     imroot = img
+		     if (noff == 1) {	# generate sky name
+		        imsky0 = imsky
+			imsky = "sky_"//imroot//seqnum
+	             } else {
+		        imsky = imsky//seqnum
+		     }			   	     		
+if(debug) print (sky1," sky ",on_grp,off_grp," ",imsky) ##DEBUG
+                  }
+if(debug) {##DEBUG
+    if (noff > 0) {
+       if(nim > 1) print ("Deleting prior sky: ",imsky0)
+       print ("Using new sky: ",imsky)
+    } else
+       print ("Using prior sky: ",imsky)
+}##DEBUG		  
+if(!debug){##DEBUG
+	          if (verbose && !last_sky) type (tmp2,>> logfile)		  
+                  if (noff > 0) {		# avoid deleting last sky
+                     if (verbose && nim > 1) print ("Deleted prior sky...")  
+		     imdel (im3, verify-, >& "dev$null")
+#		     abusky("@"//tmp2,im3,dark=dark,norm_opt=norm_opt,
+#		        norm_stat=normstat,comb_opt=combopt,
+#			reject_opt=reject,blank=bvalue,weight=weight,
+#			logfile=logfile,statsec=sec_norm,
+#			lthreshold=lthreshold,hthreshold=hthreshold,
+#			mclip=mclip,nlow=nlow,nhigh=nhigh,nkeep=nkeep,
+#		        lsigma=lsigma,hsigma=hsigma,expname=expname,
+#		        rdnoise=rdnoise,gain=gain,sigscale=sigscale,
+#		        snoise=snoise,pclip=pclip,grow=grow)
+	            imcombine("@"//tmp2,im3,sigma="",logfile=logfile,
+	               combine=combopt,reject=reject,project-,outtype="real",
+	               offsets="none",masktype="none",maskvalue=0,blank=bvalue,
+	               scale=optscale,zero=optzero,weight=weight,
+	               statsec=sec_norm,lthreshold=lthreshold,
+	               hthreshold=hthreshold,nlow=nlow,nhigh=nhigh,nkeep=nkeep,
+	               mclip=mclip,lsigma=lsigma,hsigma=hsigma,expname=expname,
+	               rdnoise=rdnoise,gain=gain,sigscale=sigscale,
+	               snoise=snoise,pclip=pclip,grow=grow)
+		     if (save_blank)
+                        imcopy (im3,imsky)
+		  } else
+		     print ("Using prior sky: ",imsky)
+}##DEBUG
+		  sky = im3
+		  on_grp0 = on_grp 
+if(!debug){##DEBUG
+                  imstatistics (sky//sec_norm,
+                     fields="mean,midpt,mode,stddev,min,max,npix,image",
+                     lower=lthreshold, upper=hthreshold, binwidth=0.001,
+	             format-,>> tmp1)  
+                  if (verbose) type (tmp1,>> logfile)
+                  l_list = tmp1 
+                  stat = fscan (l_list,skyave,skymid,skymode)
+                  l_list = ""; delete (tmp1, verify-)
+}##DEBUG		  	   
+               }
+	    }
+         } else				# use previously generated sky frame
+            sky = im3
+      } else				# use submitted sky frame
+         sky = imsky
+      if(verbose) {
+         print ("Process on-frame ",sobj," using sky ",sky," ",imsky)
+	 print ("Process on-frame ",sobj," using sky ",sky," ",imsky,>>logfile)
+      }          
+if(!debug){##DEBUG
+# Generate add report stats on object frames
+      imstatistics (sobj//sec_norm,
+         fields="mean,midpt,mode,stddev,min,max,npix,image",
+         lower=lthreshold, upper=hthreshold, binwidth=0.001, format-,>> tmp1)
+      if (verbose) type (tmp1,>> logfile)
+      l_list = tmp1 
+      stat = fscan (l_list,objave,objmid,objmode)
+      l_list = ""; delete (tmp1, verify-)
+}##DEBUG
+
+if(!debug){ ## DEBUG	 
+# Subtract the blank image from the raw data images
+      if (rescale_opt == "none") {
+         if (sky != "null")
+            imarith (sobj,"-",sky,im1,pix="r",calc="r",hparams="",verb-)
+         else
+            imarith (sobj,"-",0.0,im1,pix="r",calc="r",hparams="",verb-)
+      } else {
+         if (rescale_opt == "mean") {
+             rnorm = objave / skyave
+         } else if (rescale_opt == "median") {
+             rnorm = objmid / skymid
+         } else
+             rnorm = objmode / skymode
+### NOTE: intype and outtype might better be "real"
+         imexpr ("a-(b*c)",im1,sobj,sky,rnorm,dims="auto",intype="auto",
+            outtype="auto",refim="auto",verbose-)
+      }
+
+# Assume rest is uniform illumination and divide by flat
+      if (nflat != "null") {
+         imarith (im1,"/",nflat,im1,pixtype="r",calctype="r",hpar="")
+# Bring to zero by subtracting selected norm within image subsection
+#        bscale (im1,bzero=sopt,bscale=1.0,section=sec_norm,
+#             step=1, logfile="STDOUT", noact-) >> tmp1)
+      }
+      imstatistics (im1//sec_norm,
+         fields="mean,midpt,mode,stddev,min,max,npix",
+         lower=lthreshold, upper=hthreshold, binwidth=0.001, format-,>> tmp1)
+      if (verbose) type (tmp1,>> logfile)
+      l_list = tmp1 
+      stat = fscan (l_list,rmean,rmedian,rmode)
+      l_list = ""; delete (tmp1, verify-)
+
+# FIXPIX
+      if (fixpix) fixpix(im1, badpix, verbose-)
+
+# SETPIX
+      if (setpix) {
+# replace bad pixels with selected value
+         imexpr("a==0?b:c",sout,maskimage,svalue,im1,dims="auto",verbose-)
+      }  else
+         imcopy (im1, sout, verbose-,>> logfile)        
+
+# ORIENT  Needs to be color specific for UPSQIID   
+# imtranspose [*,-*] rotate 90 counter-clockwise
+# imtranspose [-*,*] rotate 90 clockwise
+# imcopy      [-*,-*] rotate 180
+# imcopy      [-*,*] flip about (vertical) y-axis
+# imcopy      [*,-*] flip about (horizontal) x-axis
+
+      if (orient) chorient(sout,channels=".",newid="")
+            
+      hedit (sout,"title",sout,add-,delete-,verify-,show-,update+)
+      hedit (sout,"raw_midpt",objmid,add+,delete-,verify-,show-,update+)
+      hedit (sout,"pro_midpt",rmedian,add+,delete-,verify-,show-,update+)
+      hedit (sout,"sub_midpt",skymid,add+,delete-,verify-,show-,update+)
+      hedit (sout,"sky",imsky,add+,delete-,verify-,show-,update+)
+      imdelete (im1, verify-,>& "dev$null")
+}##DEBUG     
+   }
+
+skip:
+
+# Finish up
+   inlist = ""; l_list = ""; offlist = ""
+   imdelete (im1//","//im2//","//im3,verify-,>& "dev$null")
+   if (sub_dark) imdelete ("@"//subfile, verify-, >& "dev$null")
+   delete (tmp1//","//tmp2, verify-,>& "dev$null")
+   delete (infile//","//outfile//","//subfile, verify-,>& "dev$null")
+   delete (onfile//","//offfile//","//opfile, verify-,>& "dev$null")
+   
+end
